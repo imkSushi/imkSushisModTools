@@ -1,128 +1,193 @@
-﻿using System.Text;
+﻿using System.Collections.Immutable;
+using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Text;
 
 namespace imkSushisModSourceGenerator;
 
 [Generator]
-public class RecipeCreatorGenerator : ISourceGenerator
+public class RecipeCreatorGenerator : IIncrementalGenerator
 {
-    public void Initialize(GeneratorInitializationContext context)
+    public void Initialize(IncrementalGeneratorInitializationContext context)
     {
-        context.RegisterForSyntaxNotifications(() => new RecipeSyntaxReciever());
-    }
+        var recipeMethods = context.SyntaxProvider
+            .CreateSyntaxProvider(Predicate, Transform).Where(node => node is not null);
 
-    public void Execute(GeneratorExecutionContext context)
-    {
-        var reciever = (RecipeSyntaxReciever)context.SyntaxReceiver!;
-        var output = new StringBuilder(@"using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using Terraria;
-using Terraria.Map;
-using Terraria.ModLoader;
-
-namespace imkSushisMod;
-
-
-public partial class RecipeCreator
-{");
+        var allMethods = recipeMethods.Collect();
         
-        foreach (var (name, singleStack) in reciever.MethodsToCreate)
-        {
-            var group = name.Skip(3).Select(c => c is 'g' or 'G').ToArray();
-            output.AppendLine();
-            output.Append($"    public void {name}(");
-            for (var i = 0; i < singleStack.Length - 2; i++)
-            {
-                var gp = group.Length > i && group[i];
-                output.Append((singleStack[i], gp) switch
-                {
-                    (true, true)   => $"int group{i + 1}, ",
-                    (true, false)  => $"int ingredient{i + 1}, ",
-                    (false, true)  => $"(int ingredient, int stack) group{i + 1}, ",
-                    (false, false) => $"(int ingredient, int stack) ingredient{i + 1}, ",
-                });
-            }
-
-            output.Append("int tile, ");
-            output.Append(singleStack.Last() ? "int result" : "(int item, int stack) result");
-            output.AppendLine(", bool format = FORMATRECIPES)");
-            output.AppendLine("    {");
-            output.Append("        New(new(int ingredient, int stack, bool group)[]{");
-            for (var i = 0; i < singleStack.Length - 2; i++)
-            {
-                var gp = group.Length > i && group[i];
-                output.Append((singleStack[i], gp) switch
-                {
-                    (true, true)   => $"(group{i+1}, 1, true), ",
-                    (true, false)  => $"(ingredient{i+1}, 1, false), ",
-                    (false, true)  => $"(group{i+1}.ingredient, group{i+1}.stack, true), ",
-                    (false, false) => $"(ingredient{i+1}.ingredient, ingredient{i+1}.stack, false), "
-                });
-            }
-
-            output.Append("}, new[]{tile}, ");
-            output.Append(singleStack.Last() ? "(result, 1)" : "result");
-            output.AppendLine(", format);");
-            output.AppendLine("    }");
-            output.AppendLine();
-        }
-
-        output.Append("}");
-        var sourceText = SourceText.From(output.ToString(), Encoding.UTF8);
-        context.AddSource("RecipeCreatorGenerator.Generated.cs", sourceText);
+        context.RegisterSourceOutput(allMethods, Execute!);
     }
-}
 
-public class RecipeSyntaxReciever : ISyntaxReceiver
-{
-    public HashSet<(string name, bool[] singleStack)> MethodsToCreate = new();
-
-    public void OnVisitSyntaxNode(SyntaxNode syntaxNode)
+    public static bool Predicate(SyntaxNode node, CancellationToken cancellationToken)
     {
-        if (syntaxNode is InvocationExpressionSyntax { 
-                Expression: MemberAccessExpressionSyntax { 
-                    Expression: IdentifierNameSyntax
-                    {
-                        Identifier.ValueText: "recipe"
-                    }
-                } maes 
-            } ies && maes.Name.Identifier.ValueText.StartsWith("New"))
+        return node is InvocationExpressionSyntax
         {
-            var classNode = syntaxNode;
-            while (classNode is not ClassDeclarationSyntax)
+            Expression: MemberAccessExpressionSyntax
             {
-                classNode = classNode.Parent;
-                if (classNode == null)
-                    return;
-            }
-
-            var cds = (ClassDeclarationSyntax)classNode;
-            var passed = false;
-
-            foreach (var attributeList in cds.AttributeLists)
-            {
-                foreach (var attribute in attributeList.Attributes)
+                Expression: IdentifierNameSyntax
                 {
-                    if (attribute.Name.ToString() == "GenerateRecipes")
-                        passed = true;
+                    Identifier.ValueText: "recipe"
                 }
-            }
-            if (!passed)
-                return;
-            var name = maes.Name.Identifier.ValueText;
-            var ending = name.Skip(3);
-            if (!ending.All(c => c is 'g' or 'G' or 'n' or 'N'))
-                return;
-            var args = ies.ArgumentList.Arguments;
-            var singleStack = args.Select(arg => arg.Expression is not TupleExpressionSyntax).ToArray();
-            if (MethodsToCreate.Any(method => method.name == name && singleStack.SequenceEqual(method.singleStack)))
+            } maes
+        } && maes.Name.Identifier.ValueText.StartsWith("New");
+    }
+    
+    public static InvocationExpressionSyntax? Transform(GeneratorSyntaxContext context, CancellationToken cancellationToken)
+    {
+        var classNode = GetParentClass(context);
+        if (classNode is null)
+            return null;
+
+        if (GetAllAttributes(classNode).Any(attribute => CheckIfHasGeneratesRecipeAttribute(context, attribute)))
+            return (InvocationExpressionSyntax)context.Node;
+
+        return null;
+    }
+
+    private static ClassDeclarationSyntax? GetParentClass(GeneratorSyntaxContext context)
+    {
+        return context.Node.AncestorsAndSelf().OfType<ClassDeclarationSyntax>().FirstOrDefault();
+    }
+
+    private static IEnumerable<AttributeSyntax> GetAllAttributes(ClassDeclarationSyntax classNode)
+    {
+        return classNode.AttributeLists.SelectMany(list => list.Attributes);
+    }
+
+    private static bool CheckIfHasGeneratesRecipeAttribute(GeneratorSyntaxContext context,
+        AttributeSyntax attribute)
+    {
+        if (context.SemanticModel.GetSymbolInfo(attribute).Symbol is not IMethodSymbol attributeSymbol)
+            return false;
+
+        var attributeContainingTypeSymbol = attributeSymbol.ContainingType;
+        var fullName = attributeContainingTypeSymbol.ToDisplayString();
+
+        return fullName == "imkSushisMod.GenerateRecipesAttribute";
+    }
+
+    public static void Execute(SourceProductionContext spc, ImmutableArray<InvocationExpressionSyntax> nodes)
+    {
+        var methodsToCreate = CalculateWhichMethodsToCreate(nodes);
+
+        var output = new StringBuilder("""
+                                       using System.Collections.Generic;
+                                       using System.IO;
+                                       using System.Linq;
+                                       using Terraria;
+                                       using Terraria.Map;
+                                       using Terraria.ModLoader;
+
+                                       namespace imkSushisMod;
+
+                                       public partial class RecipeCreator
+                                       {
+
+                                       """);
+        
+        foreach (var (name, singleStack) in methodsToCreate) 
+            GenerateMethod(name, output, singleStack);
+
+        output.AppendLine("}");
+        
+        spc.AddSource("RecipeCreator.g.cs", output.ToString());
+    }
+
+    private static void GenerateMethod(string name, StringBuilder output, bool[] singleStack)
+    {
+        var singleStackAndGroup = GenerateSingleStackAndGroupArray(name, singleStack);
+
+        output.Append($"""
+                       
+                           public void {name}(
+                       """);
+        for (var i = 0; i < singleStack.Length - 2; i++)
+        {
+            output.Append(singleStackAndGroup[i] switch
             {
-                return;
-            }
-            MethodsToCreate.Add((maes.Name.Identifier.ValueText, singleStack));
+                (true, true)   => $"int group{i + 1}, ",
+                (true, false)  => $"int ingredient{i + 1}, ",
+                (false, true)  => $"(int ingredient, int stack) group{i + 1}, ",
+                (false, false) => $"(int ingredient, int stack) ingredient{i + 1}, ",
+            });
         }
+
+        var outputItemParameterType = (singleStack.Last() ? "int" : "(int item, int stack)");
+        output.Append($$"""
+                        int tile, {{outputItemParameterType}} result, bool format = FORMATRECIPES)
+                            {
+                                New(new (int ingredient, int stack, bool group)[] {
+                        """);
+
+        for (var i = 0; i < singleStack.Length - 2; i++)
+        {
+            output.Append(singleStackAndGroup[i] switch
+            {
+                (true, true)   => $"(group{i + 1}, 1, true), ",
+                (true, false)  => $"(ingredient{i + 1}, 1, false), ",
+                (false, true)  => $"(group{i + 1}.ingredient, group{i + 1}.stack, true), ",
+                (false, false) => $"(ingredient{i + 1}.ingredient, ingredient{i + 1}.stack, false), "
+            });
+        }
+
+        output.AppendLine($$"""
+                            }, new[] {tile}, {{(singleStack[^1] ? "(result, 1)" : "result")}}, format);
+                                }
+                            """);
+    }
+
+    private static (bool singleStack, bool group)[] GenerateSingleStackAndGroupArray(string name, bool[] singleStack)
+    {
+        var group = WhichArgumentsAreOfGroups(name);
+        var singleStackAndGroup = new (bool singleStack, bool group)[singleStack.Length - 2];
+        for (var i = 0; i < group.Length; i++)
+            singleStackAndGroup[i] = (singleStack[i], group[i]);
+        for (var i = group.Length; i < singleStack.Length - 2; i++)
+            singleStackAndGroup[i] = (singleStack[i], false);
+        
+        return singleStackAndGroup;
+    }
+
+    private static bool[] WhichArgumentsAreOfGroups(string name)
+    {
+        return name[3..].Select(c => c is 'g' or 'G').ToArray();
+    }
+
+    private static HashSet<(string name, bool[] singleStack)> CalculateWhichMethodsToCreate(ImmutableArray<InvocationExpressionSyntax> nodes)
+    {
+        var methodsToCreate = new HashSet<(string name, bool[] singleStack)>();
+
+        foreach (var ies in nodes) 
+            RegisterMethodForCreation(ies, methodsToCreate);
+
+        return methodsToCreate;
+    }
+
+    private static void RegisterMethodForCreation(InvocationExpressionSyntax ies, HashSet<(string name, bool[] singleStack)> methodsToCreate)
+    {
+        var maes = (MemberAccessExpressionSyntax)ies.Expression;
+
+        var name = maes.Name.Identifier.ValueText;
+        var ending = name[3..];
+        if (!ending.All(c => c is 'g' or 'G' or 'n' or 'N'))
+            return;
+
+        var args = ies.ArgumentList.Arguments;
+        var singleStack = WhichArgumentsAreSingleStack(args);
+        
+        if (IsMethodAlreadyRegistered(methodsToCreate, name, singleStack))
+            return;
+
+        methodsToCreate.Add((maes.Name.Identifier.ValueText, singleStack));
+    }
+
+    private static bool[] WhichArgumentsAreSingleStack(SeparatedSyntaxList<ArgumentSyntax> args)
+    {
+        return args.Select(arg => arg.Expression is not TupleExpressionSyntax).ToArray();
+    }
+
+    private static bool IsMethodAlreadyRegistered(HashSet<(string name, bool[] singleStack)> methodsToCreate, string name, bool[] singleStack)
+    {
+        return methodsToCreate.Any(method => method.name == name && singleStack.SequenceEqual(method.singleStack));
     }
 }
